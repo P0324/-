@@ -1,0 +1,378 @@
+---
+title: "PRACME 论文 Fig.4a 复现代码"
+subtitle: "GSE31210 肺腺癌队列 · 29 基因克隆性签名 · 无复发生存（RFS）"
+format:
+  html:
+    theme: default
+execute:
+  echo: true
+  warning: false
+  message: false
+knitr:
+  opts_chunk:
+    comment: "#>"
+---
+
+::: {.callout-note}
+## 使用说明
+
+- 复现对象：原论文 **Fig.4a**（GSE31210 队列 KM 生存曲线）。
+- 原始数据 `data/raw/GSE31210_series_matrix.txt.gz` 已随项目提供（GEO 公开下载，
+  246 列样本 × 54675 探针 + 临床字符信息；其中 226 例为肺腺癌肿瘤组织，
+  另 20 例为癌旁正常肺组织，见第 2 节的样本筛选）。
+- 请在**项目根目录**（`PRACME-repro/`）下运行。
+- 原 Fig.4b（GSE68465 队列）不在本文档范围内。
+:::
+
+# 0. 环境准备
+
+```{r}
+#| label: env
+# 三个 R 包：数据整理（tidyverse）、生存分析（survival）、KM 曲线画图（survminer）
+# 首次运行前需 install.packages(c("tidyverse", "survival", "survminer"))
+library(tidyverse)
+library(survival)
+library(survminer)
+```
+
+::: {.callout-tip}
+## 与原作者所用包的对照
+
+原论文 Methods 节及 Code availability 说明：作者在 R 中完成全部分析，
+Fig.4a 相关的包为 **survival**（`coxph` 做 Cox 回归、`survdiff` 做 log-rank
+检验）和 **ggplot2**（绘制 KM 曲线）；签名构建阶段另用 glmnet（lasso 回归）等。
+
+本复现的对应关系：
+
+| 环节 | 原作者 | 本复现 | 异同 |
+|---|---|---|---|
+| Cox / log-rank | survival | survival | **完全同款** |
+| KM 曲线 | ggplot2 | survminer（ggplot2 的生存分析扩展包） | 底层同为 ggplot2，出图风格略有差异 |
+| 数据整理 | —— | tidyverse | 复现侧补充，便于按课件风格实现 |
+:::
+
+::: {.callout-tip}
+第 2 节探针映射需要一个注释数据库 `hgu133plus2.sqlite`（GPL570 平台的
+"探针 → 基因" 对应关系），已放在 `data/raw/` 下。若缺失，安装 Bioconductor
+的 `hgu133plus2.db` 注释包即可获得（下方代码会自动定位并复制）。
+:::
+
+# 1. 数据处理（一）：拆分 series matrix
+
+把 GEO 的 series matrix 拆成两份干净的数据：
+**表达矩阵**（行 = 探针，列 = 病人）和**临床表**（复发状态、无复发生存天数等）。
+
+注意：series matrix 里临床字段各行的顺序在不同样本间有错位，
+不能整行直接读，必须**按样本逐列**解析成 key-value 再拼表。
+
+另外，原始矩阵共 **246 列样本 = 226 例肺腺癌肿瘤组织 + 20 例癌旁正常
+肺组织**（GEO 官方注释）。本复现与原论文一致，**只纳入肿瘤组织**：
+正常组织无复发随访信息（relapse 为 NA），不参与无复发生存建模，
+解析完成后即显式剔除（见代码 1.4 步）。
+
+```{r}
+#| label: prepare
+lines <- readLines("data/raw/GSE31210_series_matrix.txt.gz")
+
+## ---- 1.1 样本编号 ------------------------------------------------------
+# 每行是 "标签 \t 样本1 \t 样本2 ..."，去掉第一个标签字段即得样本名列表
+split_tabs <- function(tag) {
+  v <- lines[startsWith(lines, tag)]
+  strsplit(gsub('"', "", v), "\t")[[1]][-1]
+}
+sample_id <- split_tabs("!Sample_geo_accession")
+n <- length(sample_id)                        # 246 列样本（226 肿瘤 + 20 正常，见 1.4 节筛选）
+
+## ---- 1.2 临床信息：按样本逐列收集 key-value -----------------------------
+char_rows <- lines[startsWith(lines, "!Sample_characteristics_ch1")]
+mat_ch <- do.call(rbind, lapply(char_rows, function(r) {
+  v <- strsplit(gsub('"', "", r), "\t")[[1]][-1]
+  length(v) <- n                              # 补齐成等长，才能拼成矩阵
+  v
+}))
+# 对每个病人：把他的非空字段拆成 "键: 值"
+clin_list <- lapply(seq_len(n), function(i) {
+  v <- mat_ch[, i]
+  v <- v[v != "" & !is.na(v)]
+  kv <- sub("^[^:]+:\\s*", "", v)             # 等号左边取"值"
+  names(kv) <- sub(":.*$", "", v)             # 等号右边取"键名"
+  kv
+})
+# 把 226 个 key-value 列表拼成一张规整的临床表
+all_keys <- unique(unlist(lapply(clin_list, names)))
+clin <- as.data.frame(
+  do.call(rbind, lapply(clin_list, function(kv) {
+    tmp <- rep(NA_character_, length(all_keys))
+    names(tmp) <- all_keys
+    tmp[names(kv)] <- kv
+    tmp
+  })),
+  stringsAsFactors = FALSE, check.names = FALSE
+)
+names(clin) <- make.unique(names(clin))
+clin$sample <- sample_id
+
+## ---- 1.3 表达矩阵 -------------------------------------------------------
+# 表达数据夹在 '"ID_REF"' 行与 '!series_matrix_table_end' 行之间
+i1 <- which(startsWith(lines, '"ID_REF"'))
+i2 <- which(startsWith(lines, "!series_matrix_table_end"))
+tab <- lines[i1:(i2 - 1)]
+mat <- read.table(text = tab, sep = "\t", header = TRUE, row.names = 1,
+                  check.names = FALSE, comment.char = "")
+expr <- as.matrix(mat)
+colnames(expr) <- sample_id                  # 列名统一成样本编号
+
+## ---- 1.4 样本筛选：仅保留肿瘤组织 ---------------------------------------
+# GSE31210 的 246 列样本 = 226 例肺腺癌肿瘤组织 + 20 例癌旁正常肺组织
+# （GEO 官方注释 tissue 字段）。原论文的 RFS 分析只纳入肿瘤组织——
+# 正常组织无复发随访信息（relapse 为 NA），不参与预后建模，故显式剔除，
+# 保证后文所有分析均基于 226 例肿瘤样本。
+tumor <- clin$tissue == "primary lung tumor"
+clin <- clin[tumor, , drop = FALSE]
+expr <- expr[, tumor, drop = FALSE]
+cat("样本筛选:", sum(tumor), "例肿瘤样本（剔除", sum(!tumor), "例正常组织）\n")
+
+## ---- 1.5 保存 -----------------------------------------------------------
+dir.create("results/tables", showWarnings = FALSE)
+write.csv(expr, "results/tables/GSE31210_expr.csv")
+write.csv(clin, "results/tables/GSE31210_clin.csv", row.names = FALSE)
+
+cat("表达矩阵维度:", dim(expr), "\n")        # 54675 探针 x 226 样本（肿瘤）
+cat("relapse 分布:\n"); print(table(clin$relapse, useNA = "ifany"))
+```
+
+# 2. 数据处理（二）：探针 → 基因（多探针取平均）
+
+原论文用 Brainarray CDF 处理"多个探针对应同一个基因"的问题。
+公开数据无法复刻 Brainarray，我们采用最接近的平替：
+**每个基因取它在 GPL570 芯片上的全部探针，表达量取算术平均**。
+
+映射分三步：基因名 → Entrez ID（NCBI 官方 ID，避免基因改名导致的歧义，
+如论文旧名 FTSJD1 = 现名 CMTR2、KIAA1199 = CEMIP）→ 该基因的全部探针 → 取平均。
+
+```{r}
+#| label: copy-sqlite
+# 从 hgu133plus2.db 注释包中定位数据库文件并复制到 data/raw/（供下面的 Python 使用）
+sqlite_src <- system.file("extdata", "hgu133plus2.sqlite",
+                          package = "hgu133plus2.db")
+dir.create("data/raw/hgu133plus2.db/inst/extdata", recursive = TRUE,
+           showWarnings = FALSE)
+sqlite_dst <- "data/raw/hgu133plus2.db/inst/extdata/hgu133plus2.sqlite"
+if (!file.exists(sqlite_dst)) file.copy(sqlite_src, sqlite_dst)
+```
+
+```{python}
+#| label: map-mean
+# 探针 -> 基因：29 基因 -> Entrez ID -> GPL570 全部探针 -> 逐基因取平均
+import csv, json, sqlite3, urllib.request, urllib.parse
+
+# 论文官方 29 基因签名（系数表 original29_from_paper.csv 提取自论文
+# Supplemental Table 1，随仓库提供，此处无需重新生成）
+GENES = ["ADAM9","ADAMTS1","AGPAT5","B3GALNT2","COL11A1","CPT2","DSC3",
+         "FAT1","FTSJD1","KIAA1199","MAP4K4","MCTP2","METTL1","MR1",
+         "NRIP1","PANK4","PLXND1","PWP1","RAP1GDS1","RUVBL2","SH3TC1",
+         "SNX5","SPAG5","SPRY2","SYS1","TMEM183A","TSPAN3","UVRAG","ACAT2"]
+ALIAS = {"FTSJD1": ["CMTR2"], "KIAA1199": ["CEMIP"]}   # 官方改名：论文旧名 = 现用名
+
+def eutils(path, params):
+    """访问 NCBI E-utilities 接口"""
+    url = f"https://eutils.ncbi.nlm.nih.gov/entrez/eutils/{path}?{urllib.parse.urlencode(params)}"
+    with urllib.request.urlopen(url, timeout=60) as r:
+        return json.loads(r.read())
+
+def symbols_to_entrez(genes):
+    """批量查基因的 Entrez ID；漏掉的用别名兜底、再逐个兜底"""
+    out = {}
+    # 一次批量查询所有基因
+    term = " OR ".join(f"{g}[Gene Name]" for g in genes) + " AND Homo sapiens[Organism]"
+    ids = eutils("esearch.fcgi", {"db": "gene", "term": term,
+                                  "retmode": "json", "retmax": 200})["esearchresult"]["idlist"]
+    if ids:
+        summ = eutils("esummary.fcgi", {"db": "gene", "id": ",".join(ids), "retmode": "json"})
+        for uid, doc in summ["result"].items():
+            if uid == "uids":
+                continue
+            sym = doc.get("name")
+            if sym in genes and sym not in out:
+                out[sym] = uid
+    # 兜底1：已改名的基因用现用名查（如 FTSJD1 用 CMTR2 查）
+    for g, aliases in ALIAS.items():
+        if g in out:
+            continue
+        for a in aliases:
+            try:
+                ids = eutils("esearch.fcgi", {"db": "gene",
+                            "term": f"{a}[Gene Name] AND Homo sapiens[Organism]",
+                            "retmode": "json"})["esearchresult"]["idlist"]
+                if ids:
+                    out[g] = ids[0]
+                    break
+            except Exception:
+                pass
+    # 兜底2：仍缺失的逐个查
+    for g in genes:
+        if g in out:
+            continue
+        try:
+            ids = eutils("esearch.fcgi", {"db": "gene",
+                        "term": f"{g}[Gene Name] AND Homo sapiens[Organism]",
+                        "retmode": "json"})["esearchresult"]["idlist"]
+            if ids:
+                out[g] = ids[0]
+        except Exception:
+            pass
+    return out
+
+def probes_for(entrez, sqlite_path):
+    """Entrez ID -> 该基因在 GPL570 芯片上的全部探针"""
+    con = sqlite3.connect(sqlite_path)
+    cur = con.cursor()
+    m = {}
+    for sym, gid in entrez.items():
+        rows = cur.execute("SELECT probe_id FROM probes WHERE gene_id = ?", (gid,)).fetchall()
+        m[sym] = [r[0] for r in rows]
+    return m
+
+def collapse_mean(expr_csv, probe2gene, out_csv):
+    """多探针取平均：每个基因的表达 = 其全部探针的算术平均"""
+    with open(expr_csv) as f:
+        reader = csv.reader(f)
+        header = next(reader)
+        acc = {}          # gene -> [逐样本累加和(list), 探针计数]
+        for row in reader:
+            g = probe2gene.get(row[0])    # 该探针属于哪个基因？不属于 29 基因则跳过
+            if not g:
+                continue
+            vals = [float(v) if v else 0.0 for v in row[1:]]
+            if g not in acc:
+                acc[g] = [[0.0] * len(vals), 0]
+            s = acc[g][0]
+            for i, v in enumerate(vals):
+                s[i] += v                 # 累加各探针的表达值
+            acc[g][1] += 1                # 探针计数 +1
+    with open(out_csv, "w", newline="") as f:
+        w = csv.writer(f)
+        w.writerow(["gene"] + header[1:])
+        for g in sorted(acc):
+            s, n = acc[g]
+            w.writerow([g] + [v / n for v in s])   # 平均值 = 累加和 / 探针数
+    print(f"写出 {out_csv}: {len(acc)} 基因 x {len(header)-1} 样本")
+    return set(acc)
+
+print("1) 基因名 -> Entrez ID ...")
+entrez = symbols_to_entrez(GENES)
+print(f"   成功 {len(entrez)}/{len(GENES)}; 缺失: {sorted(set(GENES)-set(entrez))}")
+
+print("2) Entrez ID -> 探针 (GPL570 / hgu133plus2) ...")
+m570 = probes_for(entrez, "data/raw/hgu133plus2.db/inst/extdata/hgu133plus2.sqlite")
+p2g = {p: g for g, ps in m570.items() for p in ps}   # 探针 -> 基因 的反向映射
+print("   探针总数:", len(p2g))
+
+print("3) 生成'探针取平均'版基因矩阵 ...")
+g570 = collapse_mean("results/tables/GSE31210_expr.csv", p2g,
+                     "results/tables/GSE31210_expr_symbol_mean.csv")
+print("覆盖检查:", len(g570), "/", len(GENES), " 缺失:", sorted(set(GENES)-g570))
+```
+
+::: {.callout-warning}
+29 基因中有 2 个（B3GALNT2、FTSJD1）在 GPL570 平台上没有独立探针，
+最终矩阵为 **27/29 基因 × 226 样本**。打分时以实际参与求和的基因数归一化
+（见下节 `sum(w) / n()`），与原论文"求和后除以基因数"的处理保持一致。
+:::
+
+# 3. 主分析：打分 → 三分位分组 → Cox / log-rank → KM 曲线（Fig.4a）
+
+流程：**归一化 → 打分 → 分组 → 检验 → 画图**。
+评分 = Σ(基因 log2 表达 × 官方系数) ÷ 基因数；按 1/3、2/3 分位数把
+226 例分成 Low / Intermediate / High 三组（作者原方法）。
+
+```{r}
+#| label: main
+## ---- 3.1 读入三份数据 ---------------------------------------------------
+expr <- read_csv("results/tables/GSE31210_expr_symbol_mean.csv")   # 27基因 x 226样本
+sig  <- read_csv("results/tables/original29_from_paper.csv")       # 官方签名：gene + coeff
+clin <- read_csv("results/tables/GSE31210_clin.csv")               # 临床信息
+
+## ---- 3.2 转长表 + 作者式归一化 + log2 ------------------------------------
+# 作者式归一化：每个样本的基因表达总和缩放到全体中位数（消除上样量差异），再 log2
+expr_long <- expr %>%
+  pivot_longer(-gene, names_to = "sample", values_to = "raw")   # 宽表 -> 长表
+
+totals <- expr_long %>%
+  group_by(sample) %>%
+  summarise(cs = sum(raw), .groups = "drop")      # 每个样本的基因总和
+
+mymed <- median(totals$cs)                        # 全体总和的中位数（缩放目标）
+
+norm <- expr_long %>%
+  left_join(totals, by = "sample") %>%
+  mutate(expr2 = log2(raw / cs * mymed + 1))      # 归一化 + log2
+
+## ---- 3.3 打分：表达 x 系数，按样本求和 -----------------------------------
+# 评分 = Σ(基因 log2 表达 x 官方系数) / 基因数；评分越高 = 克隆性信号越强
+scores <- norm %>%
+  inner_join(sig, by = "gene") %>%                # 与系数表对上（只留签名基因）
+  mutate(w = expr2 * coeff) %>%                   # 逐基因加权
+  group_by(sample) %>%
+  summarise(score = sum(w) / n(), .groups = "drop")
+
+## ---- 3.4 生存信息配对 ----------------------------------------------------
+# t.surv = 无复发生存时间（天 -> 年）；e.surv = 是否复发（复发 = 1，删失 = 0）
+sinfo <- clin %>%
+  transmute(sample,
+            t.surv = as.numeric(`days before relapse/censor`) / 365,
+            e.surv = ifelse(relapse == "relapsed", 1, 0)) %>%
+  filter(!is.na(t.surv)) %>%                      # 剔除缺生存时间者
+  inner_join(scores, by = "sample")               # 按样本编号配上分数
+
+## ---- 3.5 三分位分组（作者原方法）-----------------------------------------
+# 1/3 与 2/3 分位数为切点：低 1/3 = Low，高 1/3 = High，中间 = Intermediate
+q <- quantile(sinfo$score, c(1/3, 2/3))
+sinfo <- sinfo %>%
+  mutate(grp = ifelse(score <= q[1], "Low",
+               ifelse(score >= q[2], "High", "Intermediate")) %>%
+           factor(levels = c("High", "Intermediate", "Low")))
+print(table(sinfo$grp))                           # 预期：High 76 / Intermediate 74 / Low 76
+
+## ---- 3.6 Cox 回归：评分与复发风险的关系 ----------------------------------
+# scale(score)：标准化后，HR 表示"评分每升高 1 个标准差，复发风险变成几倍"
+cox <- coxph(Surv(t.surv, e.surv) ~ scale(score), data = sinfo)
+print(summary(cox)$coefficients)                  # 预期 HR = 1.51，p = 8.0e-05
+
+## ---- 3.7 log-rank 检验：三条生存曲线差异是否显著 --------------------------
+sd <- survdiff(Surv(t.surv, e.surv) ~ grp, data = sinfo)
+cat("log-rank p =", format.pval(1 - pchisq(sd$chisq, length(sd$n) - 1)), "\n")
+# 预期 log-rank p = 1.02e-04（原论文 1.3e-04，同数量级）
+
+## ---- 3.8 绘制 KM 生存曲线（Fig.4a）---------------------------------------
+# survfit 估计各组在各时点的生存概率；ggsurvplot 出图
+fit <- survfit(Surv(t.surv, e.surv) ~ grp, data = sinfo)
+p <- ggsurvplot(fit, data = sinfo,
+                pval = TRUE, pval.coord = c(0, 0.03),   # 图上直接标 p 值（左下角）
+                palette = c("#F8766D", "#7CAE00", "#4d4d4d"),   # 红=High 绿=Inter 灰=Low
+                legend.labs = c("High", "Intermediate", "Low"),
+                ggtheme = theme_classic(),
+                xlab = "\n Survival Time (Years)",
+                ylab = "Relapse-free Survival")
+print(p)   # 预期：红线(High)下降最快、灰线(Low)最平缓 —— 评分越高复发越快
+ggsave("results/figures/Fig4a_reproduction.png", p$plot,
+       width = 5, height = 4, dpi = 300)
+```
+
+# 4. 预期结果与原文对比
+
+| 指标 | 原论文 Fig.4a | 本复现 |
+|---|---|---|
+| 分组人数 | —— | High 76 / Intermediate 74 / Low 76 |
+| Cox HR（每 1 SD） | —— | 1.51（p = 8.0×10⁻⁵） |
+| log-rank p | 1.3×10⁻⁴ | 1.02×10⁻⁴ |
+| 曲线趋势 | High 最差、Low 最好 | 一致 |
+
+三条曲线的整体走势、组间排序与原论文高度一致；由于公开 series matrix
+无法复刻 Brainarray CDF，探针聚合方式存在差异，个别时间点的阶梯形状
+（曲线拐点）与原图不完全重合，属预期内的方法学差异。
+
+```{r}
+#| label: session
+sessionInfo()
+```
